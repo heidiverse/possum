@@ -113,10 +113,10 @@ pub grammar arithmetic() for str {
         x:(@) after() y:@ { Expression::Comparison(Comparison::After(Box::new(x), Box::new(y))) }
         x:(@) notAfter() y:@ { Expression::Comparison(Comparison::NotAfter(Box::new(x), Box::new(y))) }
         --
-        _ now() _ {Expression::Var(vec!["external.validationClock".to_owned()])}
+        _ now() _ {Expression::Var(vec!["external".to_owned(), "validationClock".to_owned()])}
         _ now() _ "as DateTime" _ {
             let unit = Expression::TimeInterval(Box::new(Expression::Atomic(Value::Int(0))), "day".to_string());
-             Expression::Operation(Operation::PlusTime(Box::new(Expression::Var(vec!["external.validationClock".to_owned()])), Box::new(unit)))
+             Expression::Operation(Operation::PlusTime(Box::new(Expression::Var(vec!["external".to_owned(), "validationClock".to_owned()])), Box::new(unit)))
         }
         --
          x:(@) or() y:@ {
@@ -311,7 +311,7 @@ pub grammar arithmetic() for str {
         Expression::Conditional{condition: Box::new(e), inner: Box::new(i), other: Some(Box::new(o))}
     }
     rule unary(stmts: &Arc<Mutex<Vec<Statement>>>) -> Expression = _ now() _ {
-        Expression::Var(vec!["external.validationClock".to_owned()])
+        Expression::Var(vec!["external".to_owned(), "validationClock".to_owned()])
     }
 
     rule keyword() = "if"/"switch"/"else"/"this"/ "true" / "false"
