@@ -551,11 +551,15 @@ impl Value {
                 serde_json::Value::Array(value_array)
             }
             Self::Object(obj) => {
+                // Sorted on the way out: objects live in a `HashMap`, and with
+                // serde_json's `preserve_order` its map keeps insertion order,
+                // so walking the `HashMap` directly would leak its random
+                // order into the JSON and change it from one run to the next.
                 let json_dict = obj
                     .iter()
                     .map(|(key, value)| (key.to_string(), value.to_serde_json()))
-                    .collect::<serde_json::Map<_, _>>();
-                serde_json::Value::Object(json_dict)
+                    .collect::<std::collections::BTreeMap<_, _>>();
+                serde_json::Value::Object(json_dict.into_iter().collect())
             }
             _ => serde_json::Value::Null,
         }
@@ -1467,5 +1471,31 @@ mod date_and_boolean_tests {
             eval("((claims.expiry as DateTime) - 1#day) is before (claims.expiry as DateTime)"),
             json!(true)
         );
+    }
+}
+
+#[cfg(test)]
+mod serialization_tests {
+    use serde_json::json;
+
+    /// Objects must come out in a fixed order. Possum keeps them in a
+    /// `HashMap`, so without sorting the order would depend on serde_json's
+    /// `preserve_order` feature and on the `HashMap`'s per-process seed.
+    #[test]
+    fn objects_serialize_in_a_stable_key_order() {
+        let data = json!({"obj": {"zebra": 1, "apple": 2, "middle": 3}});
+        let expression = crate::arithmetic::expression("obj").expect("parses");
+        let once = match expression.eval(&data).expect("evaluates") {
+            crate::Expression::Atomic(v) => v.to_serde_json().to_string(),
+            other => panic!("expected a value, got {:?}", other),
+        };
+        assert_eq!(once, r#"{"apple":2,"middle":3,"zebra":1}"#);
+        for _ in 0..100 {
+            let again = match expression.eval(&data).expect("evaluates") {
+                crate::Expression::Atomic(v) => v.to_serde_json().to_string(),
+                other => panic!("expected a value, got {:?}", other),
+            };
+            assert_eq!(again, once);
+        }
     }
 }
