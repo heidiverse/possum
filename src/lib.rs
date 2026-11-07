@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::convert::TryFrom;
 
 use chrono::Utc;
 use serde_json::json;
@@ -80,14 +81,14 @@ impl From<&serde_json::Value> for Value {
         match v {
             serde_json::Value::Null => Self::Null,
             serde_json::Value::Bool(b) => Self::Bool(*b),
-            serde_json::Value::Number(n) if n.as_f64().is_some() => {
-                Self::Float(n.as_f64().unwrap())
-            }
             serde_json::Value::Number(n) if n.as_i64().is_some() => {
                 Self::Int(n.as_i64().unwrap() as i128)
             }
             serde_json::Value::Number(n) if n.as_u64().is_some() => {
                 Self::Int(n.as_u64().unwrap() as i128)
+            }
+            serde_json::Value::Number(n) if n.as_f64().is_some() => {
+                Self::Float(n.as_f64().unwrap())
             }
             serde_json::Value::Number(_) => Self::Null,
             serde_json::Value::String(s) => Self::String(s.to_string()),
@@ -110,14 +111,21 @@ impl From<&serde_json::Value> for Value {
 }
 
 impl Expression {
+    /// Whether the value counts as `true` in a boolean position.
+    ///
+    /// Missing values, the empty string, zero and the empty array are falsy;
+    /// every other value is truthy.
     pub fn as_bool(&self) -> Result<bool, String> {
         match self {
             Expression::Atomic(Value::Bool(b)) => Ok(*b),
             Expression::Atomic(Value::Array(b)) => Ok(!b.is_empty()),
             Expression::Atomic(Value::String(b)) => Ok(!b.is_empty()),
-            Expression::Atomic(Value::Int(0)) => Ok(false),
+            Expression::Atomic(Value::Int(i)) => Ok(*i != 0),
+            Expression::Atomic(Value::Float(f)) => Ok(*f != 0.0 && !f.is_nan()),
+            Expression::Atomic(Value::TemporalAmount(_)) => Ok(true),
             Expression::Atomic(Value::Object(_)) => Ok(true),
-            _ => Ok(false),
+            Expression::Atomic(Value::Null) => Ok(false),
+            other => Err(format!("{:?} is not a value", other)),
         }
     }
     pub fn eval(&self, data: &serde_json::Value) -> Result<Expression, String> {
@@ -187,7 +195,41 @@ impl Expression {
                             Err(format!("cannot cast {:?} to {ty}", var))
                         }
                     }
-                    _ => Ok(Expression::Atomic(Value::Null)),
+                    "DateTime" => match &var {
+                        Expression::Atomic(Value::TemporalAmount(millis)) => {
+                            Ok(Expression::Atomic(Value::TemporalAmount(*millis)))
+                        }
+                        // A missing or empty value stays missing instead of
+                        // becoming a date nobody wrote down.
+                        Expression::Atomic(Value::Null) => Ok(Expression::Atomic(Value::Null)),
+                        Expression::Atomic(Value::String(s)) if s.is_empty() => {
+                            Ok(Expression::Atomic(Value::Null))
+                        }
+                        Expression::Atomic(Value::String(s)) => {
+                            match parse_date_time_to_timestamp(s) {
+                                Ok(millis) => {
+                                    Ok(Expression::Atomic(Value::TemporalAmount(millis as i128)))
+                                }
+                                Err(_) => Err(format!("cannot cast {:?} to {ty}", var)),
+                            }
+                        }
+                        _ => Err(format!("cannot cast {:?} to {ty}", var)),
+                    },
+                    "String" => match &var {
+                        Expression::Atomic(Value::Null) => Ok(Expression::Atomic(Value::Null)),
+                        Expression::Atomic(Value::String(s)) => {
+                            Ok(Expression::Atomic(Value::String(s.to_owned())))
+                        }
+                        Expression::Atomic(v) => Ok(Expression::Atomic(Value::String(
+                            match v.to_serde_json() {
+                                serde_json::Value::String(s) => s,
+                                other => other.to_string(),
+                            },
+                        ))),
+                        _ => Err(format!("cannot cast {:?} to {ty}", var)),
+                    },
+                    "Boolean" => Ok(Expression::Atomic(Value::Bool(var.as_bool()?))),
+                    _ => Err(format!("cannot cast {:?} to unknown type {ty}", var)),
                 }
             }
             Expression::Operation(op) => op.eval(data),
@@ -488,20 +530,36 @@ impl Value {
         match self {
             &Self::Bool(b) => serde_json::Value::Bool(b),
             Self::String(s) => serde_json::Value::String(s.to_owned()),
-            &Self::Int(i) => serde_json::Value::Number((i as i64).into()),
-            &Self::Float(f) => {
-                serde_json::Value::Number(serde_json::value::Number::from_f64(f).unwrap())
-            }
+            &Self::Int(i) => i64::try_from(i)
+                .map(|i| serde_json::Value::Number(i.into()))
+                .unwrap_or(serde_json::Value::Null),
+            &Self::Float(f) => serde_json::value::Number::from_f64(f)
+                .map(serde_json::Value::Number)
+                .unwrap_or(serde_json::Value::Null),
+            // A point in time reads back as the date it stands for.
+            &Self::TemporalAmount(millis) => i64::try_from(millis)
+                .ok()
+                .and_then(chrono::DateTime::from_timestamp_millis)
+                .map(|d: chrono::DateTime<Utc>| {
+                    serde_json::Value::String(
+                        d.to_rfc3339_opts(chrono::SecondsFormat::Secs, false),
+                    )
+                })
+                .unwrap_or(serde_json::Value::Null),
             Self::Array(array) => {
                 let value_array = array.iter().map(|a| a.to_serde_json()).collect::<Vec<_>>();
                 serde_json::Value::Array(value_array)
             }
             Self::Object(obj) => {
+                // Sorted on the way out: objects live in a `HashMap`, and with
+                // serde_json's `preserve_order` its map keeps insertion order,
+                // so walking the `HashMap` directly would leak its random
+                // order into the JSON and change it from one run to the next.
                 let json_dict = obj
                     .iter()
                     .map(|(key, value)| (key.to_string(), value.to_serde_json()))
-                    .collect::<serde_json::Map<_, _>>();
-                serde_json::Value::Object(json_dict)
+                    .collect::<std::collections::BTreeMap<_, _>>();
+                serde_json::Value::Object(json_dict.into_iter().collect())
             }
             _ => serde_json::Value::Null,
         }
@@ -736,6 +794,29 @@ impl Comparison {
                             Err(String::from("Could not parse string to number"))
                         }
                     }
+                    (Expression::Atomic(Value::Bool(a)), Expression::Atomic(Value::Bool(b))) => {
+                        Ok(Expression::Atomic(Value::Bool(a == b)))
+                    }
+                    (
+                        Expression::Atomic(Value::TemporalAmount(a)),
+                        Expression::Atomic(Value::TemporalAmount(b)),
+                    ) => Ok(Expression::Atomic(Value::Bool(a == b))),
+                    (Expression::Atomic(Value::Array(a)), Expression::Atomic(Value::Array(b))) => {
+                        Ok(Expression::Atomic(Value::Bool(a == b)))
+                    }
+                    (
+                        Expression::Atomic(Value::Object(a)),
+                        Expression::Atomic(Value::Object(b)),
+                    ) => Ok(Expression::Atomic(Value::Bool(a == b))),
+                    // Two missing values are equal; a missing value equals
+                    // nothing else.
+                    (Expression::Atomic(Value::Null), Expression::Atomic(Value::Null)) => {
+                        Ok(Expression::Atomic(Value::Bool(true)))
+                    }
+                    (Expression::Atomic(Value::Null), Expression::Atomic(_))
+                    | (Expression::Atomic(_), Expression::Atomic(Value::Null)) => {
+                        Ok(Expression::Atomic(Value::Bool(false)))
+                    }
                     _ => Err(format!("cannot compare {:?} {:?}", a, b)),
                 }
             }
@@ -768,52 +849,43 @@ impl Comparison {
                             Err(String::from("Could not parse string to number"))
                         }
                     }
+                    (Expression::Atomic(Value::Bool(a)), Expression::Atomic(Value::Bool(b))) => {
+                        Ok(Expression::Atomic(Value::Bool(a != b)))
+                    }
+                    (
+                        Expression::Atomic(Value::TemporalAmount(a)),
+                        Expression::Atomic(Value::TemporalAmount(b)),
+                    ) => Ok(Expression::Atomic(Value::Bool(a != b))),
+                    (Expression::Atomic(Value::Array(a)), Expression::Atomic(Value::Array(b))) => {
+                        Ok(Expression::Atomic(Value::Bool(a != b)))
+                    }
+                    (
+                        Expression::Atomic(Value::Object(a)),
+                        Expression::Atomic(Value::Object(b)),
+                    ) => Ok(Expression::Atomic(Value::Bool(a != b))),
+                    // Two missing values are equal; a missing value equals
+                    // nothing else.
+                    (Expression::Atomic(Value::Null), Expression::Atomic(Value::Null)) => {
+                        Ok(Expression::Atomic(Value::Bool(false)))
+                    }
+                    (Expression::Atomic(Value::Null), Expression::Atomic(_))
+                    | (Expression::Atomic(_), Expression::Atomic(Value::Null)) => {
+                        Ok(Expression::Atomic(Value::Bool(true)))
+                    }
                     _ => Err(format!("cannot compare {:?} {:?}", a, b)),
                 }
             }
             Comparison::Before(a, b) => {
-                let a = a.eval(data)?;
-                let b = b.eval(data)?;
-                match (&a, &b) {
-                    (
-                        Expression::Atomic(Value::TemporalAmount(a)),
-                        Expression::Atomic(Value::TemporalAmount(b)),
-                    ) => Ok(Expression::Atomic(Value::Bool(a < b))),
-                    _ => Err(format!("cannot compare {:?} {:?}", a, b)),
-                }
+                compare_dates(&a.eval(data)?, &b.eval(data)?, |a, b| a < b)
             }
             Comparison::NotBefore(a, b) => {
-                let a = a.eval(data)?;
-                let b = b.eval(data)?;
-                match (&a, &b) {
-                    (
-                        Expression::Atomic(Value::TemporalAmount(a)),
-                        Expression::Atomic(Value::TemporalAmount(b)),
-                    ) => Ok(Expression::Atomic(Value::Bool(a >= b))),
-                    _ => Err(format!("cannot compare {:?} {:?}", a, b)),
-                }
+                compare_dates(&a.eval(data)?, &b.eval(data)?, |a, b| a >= b)
             }
             Comparison::After(a, b) => {
-                let a = a.eval(data)?;
-                let b = b.eval(data)?;
-                match (&a, &b) {
-                    (
-                        Expression::Atomic(Value::TemporalAmount(a)),
-                        Expression::Atomic(Value::TemporalAmount(b)),
-                    ) => Ok(Expression::Atomic(Value::Bool(a > b))),
-                    _ => Err(format!("cannot compare {:?} {:?}", a, b)),
-                }
+                compare_dates(&a.eval(data)?, &b.eval(data)?, |a, b| a > b)
             }
             Comparison::NotAfter(a, b) => {
-                let a = a.eval(data)?;
-                let b = b.eval(data)?;
-                match (&a, &b) {
-                    (
-                        Expression::Atomic(Value::TemporalAmount(a)),
-                        Expression::Atomic(Value::TemporalAmount(b)),
-                    ) => Ok(Expression::Atomic(Value::Bool(a <= b))),
-                    _ => Err(format!("cannot compare {:?} {:?}", a, b)),
-                }
+                compare_dates(&a.eval(data)?, &b.eval(data)?, |a, b| a <= b)
             }
         }
     }
@@ -916,6 +988,43 @@ fn parse_date_time_to_timestamp(date: &str) -> Result<i64, String> {
     Err("Could not parse date".to_string())
 }
 
+/// What a value means when it is compared with `is before` / `is after`.
+enum DatePoint {
+    /// A point in time, in milliseconds since the epoch.
+    At(i128),
+    /// No date at all: a missing value or an empty string.
+    Missing,
+}
+
+fn as_date_point(expression: &Expression) -> Result<DatePoint, String> {
+    match expression {
+        Expression::Atomic(Value::TemporalAmount(millis)) => Ok(DatePoint::At(*millis)),
+        Expression::Atomic(Value::Null) => Ok(DatePoint::Missing),
+        Expression::Atomic(Value::String(s)) if s.is_empty() => Ok(DatePoint::Missing),
+        Expression::Atomic(Value::String(s)) => parse_date_time_to_timestamp(s)
+            .map(|millis| DatePoint::At(millis as i128))
+            .map_err(|_| format!("cannot read {:?} as a date", s)),
+        other => Err(format!("cannot read {:?} as a date", other)),
+    }
+}
+
+/// Compares two dates, which may be date strings, values cast with
+/// `as DateTime`, or the result of date arithmetic.
+///
+/// A date missing on either side makes the comparison `null` rather than an
+/// error, so that `(!claims.x) or ((claims.x as DateTime) is after now())`
+/// reads as "unlimited unless it has expired".
+fn compare_dates(
+    a: &Expression,
+    b: &Expression,
+    op: fn(i128, i128) -> bool,
+) -> Result<Expression, String> {
+    match (as_date_point(a)?, as_date_point(b)?) {
+        (DatePoint::At(a), DatePoint::At(b)) => Ok(Expression::Atomic(Value::Bool(op(a, b)))),
+        _ => Ok(Expression::Atomic(Value::Null)),
+    }
+}
+
 impl Operation {
     pub fn eval(&self, data: &serde_json::Value) -> Result<Expression, String> {
         match self {
@@ -987,7 +1096,7 @@ impl Operation {
                         };
 
                         Ok(Expression::Atomic(Value::TemporalAmount(
-                            left as i128 + (seconds * 1000) as i128,
+                            left as i128 - (seconds * 1000) as i128,
                         )))
                     }
                     Expression::Atomic(Value::TemporalAmount(left)) => Ok(Expression::Atomic(
@@ -999,18 +1108,23 @@ impl Operation {
                     )),
                 }
             }
+            // Both sides stop as soon as one of them settles the answer, so a
+            // guard such as `(!claims.x) or (... claims.x ...)` really does
+            // guard the expression behind it.
             Operation::And(left, right) => {
-                let left = left.eval(data)?;
-                let right = right.eval(data)?;
+                if !left.eval(data)?.as_bool()? {
+                    return Ok(Expression::Atomic(Value::Bool(false)));
+                }
                 Ok(Expression::Atomic(Value::Bool(
-                    left.as_bool()? && right.as_bool()?,
+                    right.eval(data)?.as_bool()?,
                 )))
             }
             Operation::Or(left, right) => {
-                let left = left.eval(data)?;
-                let right = right.eval(data)?;
+                if left.eval(data)?.as_bool()? {
+                    return Ok(Expression::Atomic(Value::Bool(true)));
+                }
                 Ok(Expression::Atomic(Value::Bool(
-                    left.as_bool()? || right.as_bool()?,
+                    right.eval(data)?.as_bool()?,
                 )))
             }
             Operation::Modulo(left, right) => apply_operation(
@@ -1231,6 +1345,157 @@ mod tests {
             assert_eq!(b, true);
         } else {
             panic!("should be bool")
+        }
+    }
+}
+
+#[cfg(test)]
+mod date_and_boolean_tests {
+    use crate::Expression;
+    use serde_json::json;
+
+    fn data() -> serde_json::Value {
+        json!({
+            "external": {"validationClock": "2026-10-27T10:15:00Z"},
+            "claims": {
+                "expiry": "2031-10-27",
+                "expired": "2026-07-06",
+                "ageOver18": true,
+                "empty": "",
+                "count": 1
+            }
+        })
+    }
+
+    fn eval(source: &str) -> serde_json::Value {
+        match crate::arithmetic::expression(source)
+            .expect("parses")
+            .eval(&data())
+            .expect("evaluates")
+        {
+            Expression::Atomic(v) => v.to_serde_json(),
+            other => panic!("expected a value, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn now_reads_the_validation_clock() {
+        assert_eq!(eval("now()"), json!("2026-10-27T10:15:00Z"));
+    }
+
+    #[test]
+    fn dates_from_the_data_compare() {
+        assert_eq!(
+            eval("(claims.expiry as DateTime) is after now()"),
+            json!(true)
+        );
+        assert_eq!(
+            eval("(claims.expired as DateTime) is after now()"),
+            json!(false)
+        );
+        assert_eq!(
+            eval("(claims.expiry as DateTime) is not before now()"),
+            json!(true)
+        );
+        assert_eq!(
+            eval("(claims.expired as DateTime) is before now()"),
+            json!(true)
+        );
+    }
+
+    #[test]
+    fn a_date_nobody_wrote_down_compares_to_null() {
+        assert_eq!(
+            eval("(claims.missing as DateTime) is after now()"),
+            json!(null)
+        );
+        assert_eq!(
+            eval("(claims.empty as DateTime) is after now()"),
+            json!(null)
+        );
+    }
+
+    #[test]
+    fn a_guard_protects_the_date_behind_it() {
+        let unlimited = |field: &str| {
+            eval(&format!(
+                "(!claims.{field}) or ((claims.{field} as DateTime) is after now())"
+            ))
+        };
+        assert_eq!(unlimited("missing"), json!(true));
+        assert_eq!(unlimited("empty"), json!(true));
+        assert_eq!(unlimited("expiry"), json!(true));
+        assert_eq!(unlimited("expired"), json!(false));
+    }
+
+    #[test]
+    fn booleans_compare() {
+        assert_eq!(eval("claims.ageOver18 == true"), json!(true));
+        assert_eq!(eval("claims.ageOver18 != false"), json!(true));
+        assert_eq!(eval("claims.missing == true"), json!(false));
+        assert_eq!(eval("true == true"), json!(true));
+        assert_eq!(eval("true == false"), json!(false));
+    }
+
+    #[test]
+    fn missing_values_compare() {
+        assert_eq!(eval("claims.missing == null"), json!(true));
+        assert_eq!(eval("claims.expiry == null"), json!(false));
+        assert_eq!(eval("claims.missing != null"), json!(false));
+    }
+
+    #[test]
+    fn whole_numbers_stay_whole() {
+        assert_eq!(eval("claims.count"), json!(1));
+    }
+
+    #[test]
+    fn numbers_are_truthy_unless_zero() {
+        assert_eq!(eval("!claims.count"), json!(false));
+        assert_eq!(eval("claims.count and true"), json!(true));
+        assert_eq!(eval("!0"), json!(true));
+    }
+
+    #[test]
+    fn a_computed_date_reads_back_as_a_date() {
+        assert_eq!(eval("now() as DateTime"), json!("2026-10-27T10:15:00+00:00"));
+        assert_eq!(
+            eval(r#""2022-01-01" + 3#days"#),
+            json!("2022-01-04T00:00:00+00:00")
+        );
+    }
+
+    #[test]
+    fn subtracting_from_a_date_goes_backwards() {
+        assert_eq!(
+            eval("((claims.expiry as DateTime) - 1#day) is before (claims.expiry as DateTime)"),
+            json!(true)
+        );
+    }
+}
+
+#[cfg(test)]
+mod serialization_tests {
+    use serde_json::json;
+
+    /// Objects must come out in a fixed order. Possum keeps them in a
+    /// `HashMap`, so without sorting the order would depend on serde_json's
+    /// `preserve_order` feature and on the `HashMap`'s per-process seed.
+    #[test]
+    fn objects_serialize_in_a_stable_key_order() {
+        let data = json!({"obj": {"zebra": 1, "apple": 2, "middle": 3}});
+        let expression = crate::arithmetic::expression("obj").expect("parses");
+        let once = match expression.eval(&data).expect("evaluates") {
+            crate::Expression::Atomic(v) => v.to_serde_json().to_string(),
+            other => panic!("expected a value, got {:?}", other),
+        };
+        assert_eq!(once, r#"{"apple":2,"middle":3,"zebra":1}"#);
+        for _ in 0..100 {
+            let again = match expression.eval(&data).expect("evaluates") {
+                crate::Expression::Atomic(v) => v.to_serde_json().to_string(),
+                other => panic!("expected a value, got {:?}", other),
+            };
+            assert_eq!(again, once);
         }
     }
 }
